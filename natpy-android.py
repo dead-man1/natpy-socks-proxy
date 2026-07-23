@@ -10,18 +10,35 @@ import hmac
 import argparse
 import time
 import os
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 
 
 _TCP_BUF         = 32768
 _UDP_BUF         = 32768
+_SOCK_BUF        = 131072
 _TCP_IDLE        = 60.0
 _UDP_IDLE        = 120.0
 _DNS_TTL         = 300
 _DNS_NEG_TTL     = 30
 _BACKLOG         = 64
 _DEFAULT_WORKERS = 64
+
+
+def _is_blocked_destination(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
 
 
 class _DnsCache:
@@ -178,6 +195,9 @@ class VPNSocks5Proxy:
                 return None
             dest_ip   = socket.inet_ntoa(raw[:4])
             dest_port = struct.unpack_from(">H", raw, 4)[0]
+            if _is_blocked_destination(dest_ip):
+                sock.sendall(b"\x05\x02\x00\x01" + b"\x00" * 6)
+                return None
 
         elif atyp == 0x03:
             dlen_b = self._recv_exact(sock, 1)
@@ -191,6 +211,9 @@ class VPNSocks5Proxy:
             dest_ip   = self._dns.resolve(domain)
             if dest_ip is None:
                 sock.sendall(b"\x05\x04\x00\x01" + b"\x00" * 6)
+                return None
+            if _is_blocked_destination(dest_ip):
+                sock.sendall(b"\x05\x02\x00\x01" + b"\x00" * 6)
                 return None
 
         elif atyp == 0x04:
@@ -257,6 +280,7 @@ class VPNSocks5Proxy:
                 return
 
             last_src: Optional[Tuple[str, int]] = None
+            known_dests: set = set()
             deadline = time.monotonic() + _UDP_IDLE
 
             while time.monotonic() < deadline:
@@ -287,13 +311,16 @@ class VPNSocks5Proxy:
                         parsed = self._parse_udp_header(data)
                         if parsed:
                             payload, dest = parsed
+                            if _is_blocked_destination(dest[0]):
+                                continue
                             last_src = addr
+                            known_dests.add(dest)
                             try:
                                 relay_sock.sendto(payload, dest)
                             except OSError:
                                 pass
                     else:
-                        if last_src:
+                        if last_src and addr in known_dests:
                             wrapped = self._build_udp_header(addr) + data
                             try:
                                 relay_sock.sendto(wrapped, last_src)
@@ -369,6 +396,11 @@ class VPNSocks5Proxy:
                 for s in (client_sock, remote):
                     try:
                         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except OSError:
+                        pass
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCK_BUF)
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCK_BUF)
                     except OSError:
                         pass
 
